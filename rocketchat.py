@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -10,6 +11,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from typing import Any
+from urllib.parse import quote, unquote, urljoin, urlsplit
 import httpx
 from mcp.server.fastmcp import FastMCP
 
@@ -119,7 +121,28 @@ class RocketChatAPI:
                 json=json_data,
                 params=params,
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                details = []
+                if isinstance(payload, dict):
+                    for key in ('errorType', 'error', 'message'):
+                        value = payload.get(key)
+                        if isinstance(value, str) and value not in details:
+                            details.append(value)
+                detail = ' | '.join(details) or response.reason_phrase
+                for secret in (self.auth_token, self.password):
+                    if secret:
+                        detail = detail.replace(secret, '[redacted]')
+                detail = detail[:1200]
+                raise httpx.HTTPStatusError(
+                    f'{method} {endpoint} failed (HTTP {response.status_code}): {detail}',
+                    request=error.request, response=response,
+                ) from None
             result = response.json()
             self.logger.info(f"Request {method} {endpoint} successful")
             return result
@@ -181,7 +204,64 @@ class RocketChatAPI:
             return await self.fetch_room_messages(room_id, params)
         raise last_error if last_error else Exception(f"room {room} not found")
 
-def format_message_line(msg: dict, indent: str = "") -> str:
+def walk_attachments(attachments, depth=0, quoted=False):
+    """Quotes keep a snapshot of their attachments in the containing message."""
+    if depth >= 5 or not isinstance(attachments, list):
+        return
+    for attachment in attachments[:100]:
+        if not isinstance(attachment, dict):
+            continue
+        is_quote = quoted or bool(attachment.get('message_link'))
+        yield attachment, is_quote
+        yield from walk_attachments(attachment.get('attachments'), depth + 1, is_quote)
+
+
+def uploaded_file_url(server_url: str, reference: str):
+    try:
+        base = urlsplit(server_url)
+        url = urlsplit(urljoin(server_url.rstrip('/') + '/', reference))
+    except ValueError:
+        return None
+    if (url.scheme, url.netloc) != (base.scheme, base.netloc) or url.username or url.password:
+        return None
+    parts = unquote(url.path).split('/')
+    if (len(parts) < 4 or parts[1] != 'file-upload'
+            or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', parts[2])
+            or any(part in ('.', '..') for part in parts)):
+        return None
+    return url._replace(fragment='').geturl(), parts[2]
+
+
+def message_files(msg: dict, server_url: str):
+    files = {}
+
+    def add(reference, name, mime='', quoted=False):
+        if not isinstance(reference, str):
+            return
+        resolved = uploaded_file_url(server_url, reference)
+        if not resolved:
+            return
+        url, file_id = resolved
+        if file_id not in files:
+            files[file_id] = {
+                'id': file_id, 'url': url,
+                'name': str(name or unquote(urlsplit(url).path.rsplit('/', 1)[-1]) or 'attachment'),
+                'type': str(mime or ''), 'quoted': quoted,
+            }
+
+    direct = msg.get('files') or ([msg['file']] if msg.get('file') else [])
+    for file in direct:
+        if not isinstance(file, dict) or not isinstance(file.get('_id'), str):
+            continue
+        name = str(file.get('name') or 'attachment')
+        add(f"/file-upload/{quote(file['_id'], safe='')}/{quote(name, safe='')}", name, file.get('type'))
+    for attachment, quoted in walk_attachments(msg.get('attachments')):
+        add(attachment.get('title_link') or attachment.get('image_url'),
+            attachment.get('title'), attachment.get('type') if attachment.get('type') != 'file' else '', quoted)
+    return list(files.values())
+
+
+def format_message_line(msg: dict, indent: str = "", server_url: str = "") -> str:
     """Uniform single-message rendering: timestamp + id + user + text +
     attachment captions / file hints. Fields may be null (not just absent), so
     use `or` fallbacks to keep one bad message from breaking the whole page."""
@@ -190,17 +270,23 @@ def format_message_line(msg: dict, indent: str = "") -> str:
     text = msg.get('msg', '')
     msg_id = msg.get('_id', 'N/A')
     line = f"{indent}[{ts}] (id: {msg_id}) {user}: {text}"
-    for att in msg.get('attachments') or []:
-        desc = (att.get('description') or '').strip()
+    quote_budget = 8000
+    for att, _quoted in walk_attachments(msg.get('attachments')):
+        if att.get('message_link') and quote_budget > 0:
+            text = str(att.get('text') or '')
+            excerpt = text[:quote_budget]
+            quote_budget -= len(excerpt)
+            if len(excerpt) < len(text):
+                excerpt += ' [quoted text truncated]'
+            line += f"\n{indent}  ↪ Quote from {att.get('author_name', 'Unknown')} ({att['message_link']}): {excerpt}"
+        desc = str(att.get('description') or '').strip()
         if desc:
             line += f"\n{indent}  💬 {desc}"
-    files = msg.get('files') or []
-    if not files and msg.get('file'):
-        files = [msg['file']]
-    for f in files:
+    for f in message_files(msg, server_url):
         fname = f.get('name', 'unknown')
         ftype = f.get('type', '')
-        line += f"\n{indent}  📎 {fname} ({ftype}) [use download_attachment with id: {msg_id}]"
+        origin = 'quoted attachment; ' if f['quoted'] else ''
+        line += f"\n{indent}  📎 {fname} ({ftype}) [{origin}use download_attachment with message_id: {msg_id}, attachment_id: {f['id']}]"
     return line
 
 
@@ -369,7 +455,7 @@ async def get_unread() -> str:
                 )
                 if msgs.get('success'):
                     for msg in msgs.get('messages', []):
-                        lines.append(format_message_line(msg, indent="  "))
+                        lines.append(format_message_line(msg, indent="  ", server_url=rocket_client.server_url))
                 else:
                     lines.append(f"  (failed to read messages: {msgs.get('error', 'unknown')})")
             except Exception as e:
@@ -587,7 +673,7 @@ async def get_channel_messages(room_id: str, count: int = 20, offset: int = 0) -
             if not messages:
                 return "No messages found in this channel"
 
-            formatted_messages = [format_message_line(msg) for msg in messages]
+            formatted_messages = [format_message_line(msg, server_url=rocket_client.server_url) for msg in messages]
             header = f"Messages from channel (last {len(messages)}"
             if offset:
                 header += f", offset {offset}"
@@ -626,7 +712,7 @@ async def search_messages(room_id: str, query: str, count: int = 20) -> str:
             messages = result.get('messages', [])
             if not messages:
                 return f"No messages matching '{query}' in room {room_id}"
-            formatted = [format_message_line(msg) for msg in messages]
+            formatted = [format_message_line(msg, server_url=rocket_client.server_url) for msg in messages]
             return f"Found {len(messages)} message(s) matching '{query}':\n" + "\n".join(formatted)
         else:
             error_msg = result.get('error', 'Unknown error')
@@ -638,11 +724,14 @@ async def search_messages(room_id: str, query: str, count: int = 20) -> str:
 
 
 @mcp.tool()
-async def download_attachment(message_id: str) -> str:
+async def download_attachment(message_id: str, attachment_id: str | None = None) -> str:
     """Download attachments from a message. Returns local file paths that can be viewed with the Read tool.
 
     Args:
         message_id: The message ID (shown as 'id: xxx' in message listings)
+        attachment_id: Optional file ID from the message listing. Omit to download all
+            supported files, including files inside quoted messages. Use the containing
+            message_id, not an inaccessible original message's ID.
     """
     main_logger.info(f"download_attachment called for message_id: {message_id}")
 
@@ -658,37 +747,43 @@ async def download_attachment(message_id: str) -> str:
             return f"Failed to get message: {result.get('error', 'Unknown error')}"
 
         msg = result.get('message', {})
-        files = msg.get('files', [])
-        file_obj = msg.get('file')
-
-        # some messages use a files array, others a single file object
-        if not files and file_obj:
-            files = [file_obj]
+        files = message_files(msg, rocket_client.server_url)
+        if attachment_id is not None:
+            files = [file for file in files if file['id'] == attachment_id]
+            if not files:
+                return 'The selected attachment is no longer in this message; read the message again.'
         if not files:
-            return f"Message {message_id} has no attachments"
+            return f"Message {message_id} has no supported uploaded attachments"
 
         downloaded = []
         for f in files:
-            file_id = f.get('_id')
+            file_id = f['id']
             file_name = f.get('name', 'unknown')
-            if not file_id:
-                continue
+            download_url = f['url']
+            origin = urlsplit(rocket_client.server_url)
+            for redirect in range(6):
+                target = urlsplit(download_url)
+                same_origin = (target.scheme, target.netloc) == (origin.scheme, origin.netloc)
+                if (target.scheme not in ('http', 'https') or target.username or target.password
+                        or (origin.scheme == 'https' and target.scheme != 'https')
+                        or (same_origin and not uploaded_file_url(rocket_client.server_url, download_url))):
+                    raise ValueError('Unsupported attachment download destination')
+                resp = await rocket_client._get_client().get(
+                    download_url,
+                    headers=rocket_client._auth_headers() if same_origin else {},
+                    timeout=60.0, follow_redirects=False,
+                )
+                if not resp.is_redirect:
+                    break
+                if redirect == 5 or not resp.headers.get('location'):
+                    raise ValueError('Too many or invalid attachment redirects')
+                download_url = urljoin(download_url, resp.headers['location'])
+            if not resp.is_success:
+                raise ValueError(f'Attachment download failed (HTTP {resp.status_code})')
 
-            # RocketChat file download URL
-            download_url = f"{rocket_client.server_url}/file-upload/{file_id}/{file_name}"
-            main_logger.info(f"Downloading: {download_url}")
-
-            resp = await rocket_client._get_client().get(
-                download_url,
-                headers=rocket_client._auth_headers(),
-                timeout=60.0,
-                follow_redirects=True,
-            )
-            resp.raise_for_status()
-
-            # save to the temp dir
-            save_path = os.path.join(tempfile.gettempdir(), f"rc_{file_id}_{file_name}")
-            with open(save_path, "wb") as out:
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', file_name).strip(' .')[:120] or 'attachment'
+            fd, save_path = tempfile.mkstemp(prefix=f'rc_{file_id[:64]}_', suffix=f'_{safe_name}')
+            with os.fdopen(fd, "wb") as out:
                 out.write(resp.content)
 
             downloaded.append(save_path)

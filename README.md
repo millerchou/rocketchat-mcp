@@ -29,6 +29,24 @@ on a Rocket.Chat workspace over stdio.
 | `get_user_info` | Get a user's profile |
 | `create_channel` | Create a channel |
 
+### Quoted messages and attachments
+
+Message listings include quoted text and uploaded files inside quotes. A quote is a
+snapshot shared in the containing message; the original room may no longer be accessible.
+Use the **containing message ID** when downloading a quoted attachment. You do not need
+to read the original room first.
+
+`download_attachment(message_id, attachment_id)` downloads the selected file ID shown
+in the listing. Omitting `attachment_id` retains the existing behavior of downloading
+all supported attachments, now including quoted files. The server still enforces file
+access permissions. File references must originate from this Rocket.Chat server's
+upload path; redirects to file storage do not receive Rocket.Chat authentication headers.
+Downloads use unique temporary filenames and do not overwrite prior downloads.
+
+HTTP errors include the server's error type and message when available, so a missing
+message, an access failure, and a network failure are not reduced to the same diagnosis.
+Configured authentication secrets are excluded from these error summaries.
+
 &lowast; `list_all_rooms` and `list_users` call workspace-wide endpoints
 (`channels.list` / `users.list`) that require admin or the corresponding
 `view-*` permission. Every other tool works for a normal chat user.
@@ -90,6 +108,14 @@ uv run rocketchat.py --server-url https://chat.example.com \
 ```
 
 ## Reliability
+
+Run the offline attachment and API error tests with:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+The tests use synthetic messages and an HTTP mock transport; no chat account is needed.
 
 Persistent HTTP connection pool, room-endpoint caching, log rotation (1 MB),
 and an orphan watchdog that self-exits when the MCP client process dies.
